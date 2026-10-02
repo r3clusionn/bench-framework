@@ -22,6 +22,7 @@ pub mod micro;
 pub mod report;
 pub mod runner;
 pub mod stats;
+pub mod trace;
 
 pub use report::{Environment, Report, Suite};
 pub use runner::{measure, BenchResult, Config, Throughput};

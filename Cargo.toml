@@ -1,6 +1,6 @@
 [package]
 name = "benchlab"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A benchmarking harness with warmup, percentiles, outlier handling, CPU pinning, JSON output and regression detection, plus CPU, memory and cache microbenchmarks."
 license = "MIT"
@@ -17,6 +17,19 @@ clap = { version = "4", features = ["derive"] }
 libm = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Console",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Diagnostics_Etw",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
+  "Win32_System_Time",
+]
 
 [dev-dependencies]
 tempfile = "3"
