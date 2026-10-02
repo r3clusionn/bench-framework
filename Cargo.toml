@@ -1,0 +1,27 @@
+[package]
+name = "benchlab"
+version = "0.1.0"
+edition = "2021"
+description = "A benchmarking harness with warmup, percentiles, outlier handling, CPU pinning, JSON output and regression detection, plus CPU, memory and cache microbenchmarks."
+license = "MIT"
+
+[lib]
+name = "benchlab"
+
+[[bin]]
+name = "benchlab"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+libm = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+debug = false
