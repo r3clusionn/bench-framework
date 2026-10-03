@@ -7,11 +7,18 @@
 //! * [`presentmon`] starts a PresentMon capture alongside the trace and summarises its CSV.
 //! * [`render`] prints the report.
 
+pub mod analysis;
 pub mod etl;
+pub mod export;
+pub mod full;
+pub mod html;
 pub mod model;
 pub mod presentmon;
 pub mod render;
+pub mod render_sys;
+pub mod session;
 pub mod symbols;
+pub mod sys;
 pub mod xperf;
 
 use std::io::{BufRead, Write};
@@ -91,6 +98,10 @@ pub struct RecordOptions {
     pub symbols: bool,
     pub analysis: AnalysisOptions,
     pub top: usize,
+    /// Record the graphics providers too (`None`: as the preset says).
+    pub graphics: Option<bool>,
+    /// Focus process for the full report (default: the one presenting most frames).
+    pub focus: Option<String>,
 }
 
 #[derive(Debug)]
@@ -99,6 +110,7 @@ pub struct Recorded {
     pub etl: PathBuf,
     pub report: Option<PathBuf>,
     pub presentmon_csv: Option<PathBuf>,
+    pub html: Option<PathBuf>,
     pub text: String,
 }
 
@@ -148,6 +160,12 @@ pub fn record(o: &RecordOptions) -> Result<Recorded, String> {
     let dir = PathBuf::from(dir.to_string_lossy().trim_start_matches(r"\\?\"));
     let raw = dir.join("kernel.etl");
     let etl = dir.join("trace.etl");
+    let graphics = o.graphics.unwrap_or(preset.graphics && o.flags.is_none());
+    let graphics_etl = dir.join("graphics.etl");
+    let kernel_merged = dir.join("kernel-merged.etl");
+    // A full report needs scheduling, samples or frames; a DPC-only trace gets the DPC report.
+    let full_report = graphics
+        || ["CSWITCH", "PROFILE", "DIAG", "LATENCY"].iter().any(|f| flags.to_ascii_uppercase().split('+').any(|x| x == *f));
 
     let loggers = xperf::run(&tools.xperf, &["-loggers".to_string()])?;
     if xperf::kernel_logger_running(&loggers.text) {
@@ -162,7 +180,8 @@ pub fn record(o: &RecordOptions) -> Result<Recorded, String> {
 
     let mut pm_child = None;
     let mut pm_csv = None;
-    if let Some(path) = &o.presentmon {
+    // With the graphics providers in the trace, PresentMon analyses the trace afterwards instead.
+    if let Some(path) = o.presentmon.as_ref().filter(|_| !graphics) {
         let exe = presentmon::find(if path.as_os_str().is_empty() { None } else { Some(path) })?;
         let csv = dir.join("presentmon.csv");
         let cap = presentmon::Capture {
@@ -189,10 +208,22 @@ pub fn record(o: &RecordOptions) -> Result<Recorded, String> {
         }
     }
 
+    let user = if graphics {
+        match session::UserSession::start(GRAPHICS_SESSION, &graphics_etl) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                cleanup_pm(&mut pm_child);
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
     let plan = xperf::StartPlan::new(&flags, &stackwalk, &raw);
     let started = xperf::run(&tools.xperf, &plan.args())?;
     if !started.ok {
         cleanup_pm(&mut pm_child);
+        drop(user);
         return Err(format!("xperf could not start the trace: {}", started.text));
     }
     eprintln!("tracing {flags}{}", if stackwalk.is_empty() { String::new() } else { format!(" with stacks for {stackwalk}") });
@@ -213,12 +244,24 @@ pub fn record(o: &RecordOptions) -> Result<Recorded, String> {
     }
 
     eprintln!("stopping and merging (this adds the driver and process information WPA needs)");
-    let stopped = xperf::run(&tools.xperf, &xperf::stop_and_merge_args(&etl))?;
-    if !etl.is_file() {
+    let kernel_out = if graphics { &kernel_merged } else { &etl };
+    let stopped = xperf::run(&tools.xperf, &xperf::stop_and_merge_args(kernel_out))?;
+    if let Some(u) = user {
+        u.stop()?;
+    }
+    if !kernel_out.is_file() {
         cleanup_pm(&mut pm_child);
-        return Err(format!("xperf did not produce {}: {}", etl.display(), stopped.text));
+        return Err(format!("xperf did not produce {}: {}", kernel_out.display(), stopped.text));
     }
     let _ = std::fs::remove_file(&raw);
+    if graphics {
+        let m = xperf::run(&tools.xperf, &xperf::merge_args(&[kernel_merged.clone(), graphics_etl.clone()], &etl))?;
+        if !etl.is_file() {
+            return Err(format!("xperf could not merge the graphics trace: {}", m.text));
+        }
+        let _ = std::fs::remove_file(&kernel_merged);
+        let _ = std::fs::remove_file(&graphics_etl);
+    }
 
     if let Some(mut c) = pm_child.take() {
         if o.timed_s.is_some() {
@@ -230,6 +273,38 @@ pub fn record(o: &RecordOptions) -> Result<Recorded, String> {
         }
         let _ = c.kill();
         let _ = c.wait();
+    }
+
+    if full_report {
+        let ao = full::AnalyzeOptions {
+            analysis: analysis::Options {
+                focus: o.focus.as_deref().map(analysis::Focus::parse),
+                top: o.top,
+                ..Default::default()
+            },
+            symbols: o.symbols,
+            presentmon: match &o.presentmon {
+                Some(p) if !p.as_os_str().is_empty() => full::PresentMonChoice::Path(p.clone()),
+                _ => full::PresentMonChoice::Auto,
+            },
+            presentmon_csv: Some(dir.join("presentmon.csv")),
+            dpc_functions: o.analysis.by_function,
+            ..Default::default()
+        };
+        let (trace, a) = full::analyze_file(&etl, &ao)?;
+        let report = dir.join("report.txt");
+        std::fs::write(&report, &a.text).map_err(|e| format!("{}: {e}", report.display()))?;
+        let _ = std::fs::write(dir.join("report.json"), full::to_json(&a));
+        let html = dir.join("report.html");
+        let _ = std::fs::write(&html, html::render(&a, &trace, &etl.to_string_lossy()));
+        return Ok(Recorded {
+            dir,
+            etl,
+            report: Some(report),
+            presentmon_csv: a.presentmon_csv.clone().or(pm_csv).filter(|p| p.is_file()),
+            html: Some(html),
+            text: a.text,
+        });
     }
 
     let analysis = report_file(&etl, &o.analysis, o.symbols)?;
@@ -248,7 +323,7 @@ pub fn record(o: &RecordOptions) -> Result<Recorded, String> {
     std::fs::write(&report, &text).map_err(|e| format!("{}: {e}", report.display()))?;
     let json = dir.join("report.json");
     let _ = std::fs::write(&json, serde_json::to_string_pretty(&analysis).unwrap_or_default());
-    Ok(Recorded { dir, etl, report: Some(report), presentmon_csv: pm_csv.filter(|p| p.is_file()), text })
+    Ok(Recorded { dir, etl, report: Some(report), presentmon_csv: pm_csv.filter(|p| p.is_file()), html: None, text })
 }
 
 /// Reads and analyses a trace file. With `symbols`, routines are named `driver!Function`.
@@ -290,10 +365,14 @@ pub fn merge(inputs: &[PathBuf], out: &Path) -> Result<String, String> {
     Ok(r.text)
 }
 
+/// Name of the graphics session `record` starts next to the kernel logger.
+pub const GRAPHICS_SESSION: &str = "benchlab-graphics";
+
 /// Stops a running kernel logger; with `out` it also merges what was recorded into that file.
 pub fn stop(out: Option<&Path>) -> Result<String, String> {
     let tools = xperf::find_tools()?;
     need_admin()?;
+    session::UserSession::stop_by_name(GRAPHICS_SESSION);
     let args = match out {
         Some(p) => xperf::stop_and_merge_args(p),
         None => vec!["-stop".to_string()],
@@ -352,6 +431,9 @@ pub fn presets_table() -> String {
     let mut out = String::new();
     for p in xperf::PRESETS {
         out.push_str(&format!("{:<w$}  {}\n", p.name, p.about));
+        if p.graphics {
+            out.push_str(&format!("{:<w$}  graphics: DXGI, D3D9, DxgKrnl, Win32k and DWM events (a second session)\n", ""));
+        }
         out.push_str(&format!("{:<w$}  flags: {}\n", "", p.flags));
         if !p.stackwalk.is_empty() {
             out.push_str(&format!("{:<w$}  stacks: {}\n", "", p.stackwalk));

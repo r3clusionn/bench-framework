@@ -78,6 +78,8 @@ fn reader_agrees_with_xperf_on_a_live_trace() {
         symbols: false,
         analysis: AnalysisOptions::default(),
         top: 5,
+        graphics: None,
+        focus: None,
     };
     let rec = trace::record(&opts).expect("record");
     assert!(rec.etl.is_file() && rec.report.as_ref().unwrap().is_file());

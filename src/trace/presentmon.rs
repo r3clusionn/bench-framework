@@ -14,18 +14,22 @@ use serde::{Deserialize, Serialize};
 use super::model::Dist;
 
 /// A metric PresentMon reports, with the column names it has had.
+///
+/// 2.x writes `FrameTime`, `CPUBusy`, ... with `--v2_metrics` and `MsBetweenPresents`,
+/// `MsCPUBusy`, ... by default; 1.x writes `msBetweenPresents`, ... Names match without case.
 const METRICS: &[(&str, &[&str])] = &[
     ("Frame time", &["FrameTime", "msBetweenPresents"]),
-    ("CPU busy", &["CPUBusy"]),
-    ("CPU wait", &["CPUWait"]),
-    ("GPU busy", &["GPUBusy"]),
-    ("GPU wait", &["GPUWait"]),
-    ("GPU time", &["GPUTime", "msGPUActive"]),
+    ("CPU busy", &["CPUBusy", "MsCPUBusy"]),
+    ("CPU wait", &["CPUWait", "MsCPUWait"]),
+    ("GPU latency", &["GPULatency", "MsGPULatency"]),
+    ("GPU busy", &["GPUBusy", "MsGPUBusy"]),
+    ("GPU wait", &["GPUWait", "MsGPUWait"]),
+    ("GPU time", &["GPUTime", "MsGPUTime", "msGPUActive"]),
     ("Displayed time", &["DisplayedTime", "msBetweenDisplayChange"]),
     ("In present API", &["msInPresentAPI"]),
     ("Until displayed", &["DisplayLatency", "msUntilDisplayed"]),
-    ("Input to photon", &["AllInputToPhotonLatency"]),
-    ("Click to photon", &["ClickToPhotonLatency"]),
+    ("Input to photon", &["AllInputToPhotonLatency", "MsAllInputToPhotonLatency"]),
+    ("Click to photon", &["ClickToPhotonLatency", "MsClickToPhotonLatency"]),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +139,69 @@ pub fn spawn(exe: &Path, c: &Capture, csv: &Path) -> Result<Child, String> {
         .map_err(|e| format!("{}: {e}", exe.display()))
 }
 
+/// Arguments to analyse an existing trace: `--etl_file` with QPC timestamps, so every frame can be
+/// placed on the trace's own time line.
+pub fn etl_args(etl: &Path, csv: &Path, syntax: Syntax) -> Vec<String> {
+    let dash = match syntax {
+        Syntax::Single => "-",
+        Syntax::Double => "--",
+    };
+    let mut a = vec![
+        format!("{dash}etl_file"),
+        etl.to_string_lossy().into_owned(),
+        format!("{dash}output_file"),
+        csv.to_string_lossy().into_owned(),
+        format!("{dash}qpc_time"),
+    ];
+    a.push(match syntax {
+        Syntax::Single => "-no_top".to_string(),
+        Syntax::Double => "--no_console_stats".to_string(),
+    });
+    a
+}
+
+/// Runs PresentMon over a trace file and returns its CSV.
+pub fn run_on_etl(exe: &Path, etl: &Path, csv: &Path) -> Result<String, String> {
+    let syntax = detect_syntax(exe);
+    let _ = std::fs::remove_file(csv);
+    let out = Command::new(exe)
+        .args(etl_args(etl, csv, syntax))
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{}: {e}", exe.display()))?;
+    std::fs::read_to_string(csv).map_err(|_| {
+        let err = String::from_utf8_lossy(&out.stderr);
+        format!("PresentMon wrote no CSV: {}", err.trim().lines().last().unwrap_or("no output"))
+    })
+}
+
+/// Per-frame GPU busy time from a CSV written with `--qpc_time`: (pid, QPC value of the present,
+/// GPU busy ms).
+pub fn qpc_frames(csv: &str) -> Vec<(u32, i64, f64)> {
+    let mut lines = csv.lines().filter(|l| !l.trim().is_empty());
+    let Some(head) = lines.next() else {
+        return Vec::new();
+    };
+    let header = split_csv(head.trim_start_matches('\u{feff}'));
+    let col = |names: &[&str]| header.iter().position(|h| names.iter().any(|n| h.eq_ignore_ascii_case(n)));
+    let (Some(pid), Some(t), Some(gpu)) =
+        (col(&["ProcessID"]), col(&["TimeInQPC", "CPUStartQPC"]), col(&["MsGPUBusy", "GPUBusy"]))
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in lines {
+        let f = split_csv(line);
+        let (Some(p), Some(q), Some(g)) = (f.get(pid), f.get(t), f.get(gpu)) else {
+            continue;
+        };
+        if let (Ok(p), Ok(q), Some(g)) = (p.trim().parse::<u32>(), q.trim().parse::<i64>(), number(g)) {
+            out.push((p, q, g));
+        }
+    }
+    out
+}
+
 /// Splits one CSV line, honouring double quotes.
 pub fn split_csv(line: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -195,7 +262,12 @@ pub fn summarize(csv: &str) -> Result<Summary, String> {
     let col = |names: &[&str]| header.iter().position(|h| names.iter().any(|n| h.eq_ignore_ascii_case(n)));
     let app_col = col(&["Application"]).ok_or("not a PresentMon CSV: no Application column")?;
     let frame_col = col(&["FrameTime", "msBetweenPresents"]).ok_or("not a PresentMon CSV: no frame time column")?;
-    let time_col = col(&["TimeInSeconds"]);
+    // Present time: seconds (1.x and 2.x with `--v1_metrics`) or milliseconds (2.x `TimeInMs`). A
+    // QPC column (`--qpc_time`) has no unit here, so the duration then comes from the frame times.
+    let (time_col, time_scale) = match col(&["TimeInSeconds"]) {
+        Some(c) => (Some(c), 1.0),
+        None => (col(&["TimeInMs"]), 1e-3),
+    };
     let dropped_col = col(&["Dropped"]);
     let metric_cols: Vec<(&str, usize)> = METRICS.iter().filter_map(|(label, names)| col(names).map(|c| (*label, c))).collect();
 
@@ -224,7 +296,7 @@ pub fn summarize(csv: &str) -> Result<Summary, String> {
         if dropped_col.and_then(|c| f.get(c)).is_some_and(|v| v.trim() == "1") {
             acc.dropped += 1;
         }
-        if let Some(t) = time_col.and_then(|c| f.get(c)).and_then(|v| number(v)) {
+        if let Some(t) = time_col.and_then(|c| f.get(c)).and_then(|v| number(v)).map(|t| t * time_scale) {
             acc.first_t = acc.first_t.min(t);
             acc.last_t = acc.last_t.max(t);
         }
@@ -348,6 +420,31 @@ dwm.exe,5,0x2,Other,0,0,0,Composed,0,1.000,0.1,16.0,16.0,1.0,1.0\n";
         assert!(summarize("a,b\n1,2\n").is_err());
         assert!(summarize("Application,FrameTime\n").unwrap().apps.is_empty());
         assert!(summarize("Application,FrameTime\nx.exe,notanumber\nx.exe\n").unwrap().apps.is_empty());
+    }
+
+    #[test]
+    fn version_two_six_default_columns_and_millisecond_times() {
+        // PresentMon 2.6 without --v2_metrics: Ms-prefixed names and TimeInMs.
+        let csv = "Application,ProcessID,TimeInMs,MsBetweenPresents,MsCPUBusy,MsCPUWait,MsGPUBusy,MsGPUWait,MsGPUTime,MsAllInputToPhotonLatency\n\
+x.exe,4,100.0,10.0,6.0,4.0,8.0,2.0,8.5,NA\n\
+x.exe,4,110.0,10.0,7.0,3.0,9.0,1.0,9.5,30.0\n\
+x.exe,4,130.0,20.0,8.0,12.0,9.0,11.0,9.0,NA\n";
+        let s = summarize(csv).unwrap();
+        let a = &s.apps[0];
+        let names: Vec<&str> = a.metrics.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["Frame time", "CPU busy", "CPU wait", "GPU busy", "GPU wait", "GPU time", "Input to photon"]);
+        // 30 ms between the first and last present.
+        assert!((a.seconds - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn qpc_frames_and_etl_arguments() {
+        let csv = "Application,ProcessID,TimeInQPC,MsBetweenPresents,MsGPUBusy\nx.exe,4,123456789,10.0,8.5\nx.exe,4,123556789,10.0,NA\ny.exe,nope,1,1,1\n";
+        assert_eq!(qpc_frames(csv), vec![(4, 123456789, 8.5)]);
+        assert!(qpc_frames("Application,FrameTime\nx,1\n").is_empty());
+        let a = etl_args(Path::new("t.etl"), Path::new("o.csv"), Syntax::Double);
+        assert_eq!(a, ["--etl_file", "t.etl", "--output_file", "o.csv", "--qpc_time", "--no_console_stats"]);
+        assert_eq!(etl_args(Path::new("t.etl"), Path::new("o.csv"), Syntax::Single)[0], "-etl_file");
     }
 
     #[test]

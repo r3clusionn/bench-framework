@@ -65,6 +65,10 @@ impl Resolver {
     pub fn resolve(&mut self, _addr: u64) -> String {
         String::new()
     }
+
+    pub fn image(&self, _addr: u64) -> Option<&super::model::Image> {
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -103,8 +107,9 @@ mod win {
     const SYMOPT_UNDNAME: u32 = 0x2;
     const SYMOPT_DEFERRED_LOADS: u32 = 0x4;
     const SYMOPT_FAIL_CRITICAL_ERRORS: u32 = 0x0020_0000;
-    /// A fake process handle: DbgHelp only uses it as a key for its own state.
-    const SESSION: isize = 0x0bec_0001;
+    /// Fake process handles: DbgHelp only uses them as keys for its own state, so each resolver
+    /// (the kernel's, and one per traced process) gets its own.
+    static NEXT_SESSION: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0x0bec_0001);
 
     type SymSetOptions = unsafe extern "system" fn(u32) -> u32;
     type SymInitializeW = unsafe extern "system" fn(isize, *const u16, i32) -> i32;
@@ -167,6 +172,7 @@ mod win {
     }
 
     pub struct Resolver {
+        session: isize,
         map: ImageMap,
         images: Vec<Image>,
         loaded: HashMap<u64, bool>,
@@ -213,10 +219,12 @@ mod win {
                     None => default_symbol_path(),
                 };
                 let path_w = wide(&path);
-                if initialize(SESSION, if path.is_empty() { std::ptr::null() } else { path_w.as_ptr() }, 0) == 0 {
+                let session = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if initialize(session, if path.is_empty() { std::ptr::null() } else { path_w.as_ptr() }, 0) == 0 {
                     return Err("SymInitialize failed".to_string());
                 }
                 let mut r = Resolver {
+                    session,
                     map: ImageMap::new(images),
                     images: images.to_vec(),
                     loaded: HashMap::new(),
@@ -232,6 +240,11 @@ mod win {
                 r.images.sort_by_key(|i| i.base);
                 Ok(r)
             }
+        }
+
+        /// The image that contains an address.
+        pub fn image(&self, addr: u64) -> Option<&Image> {
+            self.map.find(addr)
         }
 
         /// True when the symbol-server-capable DbgHelp from the toolkit is in use.
@@ -267,7 +280,7 @@ mod win {
             }
             let base = unsafe {
                 (self.load_module)(
-                    SESSION,
+                    self.session,
                     0,
                     wide(&path).as_ptr(),
                     std::ptr::null(),
@@ -297,7 +310,7 @@ mod win {
                         unsafe {
                             (*info).size_of_struct = std::mem::size_of::<SymbolInfoW>() as u32;
                             (*info).max_name_len = MAX_NAME as u32;
-                            if (self.from_addr)(SESSION, addr, &mut disp, info) != 0 {
+                            if (self.from_addr)(self.session, addr, &mut disp, info) != 0 {
                                 let n = ((*info).name_len as usize).min(MAX_NAME);
                                 let p = std::ptr::addr_of!((*info).name) as *const u16;
                                 // The nearest export far below an address is not its function.
@@ -318,7 +331,7 @@ mod win {
     impl Drop for Resolver {
         fn drop(&mut self) {
             unsafe {
-                (self.cleanup)(SESSION);
+                (self.cleanup)(self.session);
             }
         }
     }

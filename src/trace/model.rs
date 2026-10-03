@@ -69,6 +69,9 @@ pub struct Trace {
     pub cpu_count: usize,
     pub events_lost: u32,
     pub buffers_lost: u32,
+    /// Scheduling, sampling, I/O and present events (empty for a DPC-only trace).
+    #[serde(skip)]
+    pub sys: super::sys::SysEvents,
 }
 
 /// Maps an address to the image that contains it.

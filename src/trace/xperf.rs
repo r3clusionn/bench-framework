@@ -13,6 +13,8 @@ pub struct Preset {
     pub flags: &'static str,
     pub stackwalk: &'static str,
     pub about: &'static str,
+    /// Also record the graphics providers (Present calls, GPU work) in a second session.
+    pub graphics: bool,
 }
 
 pub const PRESETS: &[Preset] = &[
@@ -21,36 +23,49 @@ pub const PRESETS: &[Preset] = &[
         flags: "PROC_THREAD+LOADER+DPC+INTERRUPT",
         stackwalk: "",
         about: "ISR and DPC durations per driver. Small traces, what `benchlab trace report` reads.",
+        graphics: false,
+    },
+    Preset {
+        name: "game",
+        flags: "PROC_THREAD+LOADER+DPC+INTERRUPT+CSWITCH+DISPATCHER+PROFILE+HARD_FAULTS+DISK_IO+DISK_IO_INIT+FILENAME",
+        stackwalk: "Profile+CSwitch+ReadyThread",
+        about: "Everything `trace analyze` reads: frames (Present calls and GPU work), scheduling, CPU samples with stacks, DPC/ISR, hard faults, disk.",
+        graphics: true,
     },
     Preset {
         name: "latency",
         flags: "PROC_THREAD+LOADER+DPC+INTERRUPT+CSWITCH+PROFILE",
         stackwalk: "Profile+CSwitch+ReadyThread",
         about: "DPC and ISR plus scheduling and CPU sampling with stacks: why a thread was late in WPA.",
+        graphics: false,
     },
     Preset {
         name: "cpu",
         flags: "PROC_THREAD+LOADER+PROFILE+CSWITCH+DISPATCHER",
         stackwalk: "Profile+CSwitch+ReadyThread",
         about: "Where CPU time goes and what threads wait on.",
+        graphics: false,
     },
     Preset {
         name: "disk",
         flags: "PROC_THREAD+LOADER+DISK_IO+DISK_IO_INIT+FILE_IO+FILE_IO_INIT+FILENAME+HARD_FAULTS",
         stackwalk: "DiskReadInit+DiskWriteInit",
         about: "Disk and file activity, hard faults.",
+        graphics: false,
     },
     Preset {
         name: "power",
         flags: "PROC_THREAD+LOADER+POWER+IDLE_STATES+PROFILE+CLOCKINT",
         stackwalk: "",
         about: "Idle states, clock interrupts and power events.",
+        graphics: false,
     },
     Preset {
         name: "full",
         flags: "Diag",
         stackwalk: "Profile+CSwitch+ReadyThread",
         about: "xperf's own Diag group: everything useful for a general investigation, large traces.",
+        graphics: false,
     },
 ];
 

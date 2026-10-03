@@ -1,8 +1,8 @@
 [package]
 name = "benchlab"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "A benchmarking harness with warmup, percentiles, outlier handling, CPU pinning, JSON output and regression detection, plus CPU, memory and cache microbenchmarks."
+description = "A benchmarking harness with regression detection and microbenchmarks, plus Windows trace capture and WPA-style analysis: FPS and lows, slow frames explained, CPU, scheduling, DPC/ISR, hard faults and disk."
 license = "MIT"
 
 [lib]
@@ -38,3 +38,17 @@ tempfile = "3"
 lto = true
 codegen-units = 1
 debug = false
+
+[target.'cfg(windows)'.dev-dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Performance",
+  "Win32_UI_WindowsAndMessaging",
+]

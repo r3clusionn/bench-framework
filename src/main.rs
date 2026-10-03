@@ -72,9 +72,9 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum TraceCmd {
-    /// Record a kernel trace, then print a DPC/ISR report (needs an elevated terminal)
+    /// Record a trace, then print its report (needs an elevated terminal). `--preset game` captures a game
     Record {
-        /// What to trace: dpc, latency, cpu, disk, power or full (see `trace presets`)
+        /// What to trace: dpc, game, latency, cpu, disk, power or full (see `trace presets`)
         #[arg(long, default_value = "dpc")]
         preset: String,
         /// Kernel flags instead of a preset, joined with +, e.g. PROC_THREAD+LOADER+DPC+INTERRUPT
@@ -101,9 +101,15 @@ enum TraceCmd {
         /// Capture frame data with PresentMon at the same time (optionally the path to PresentMon.exe)
         #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
         presentmon: Option<PathBuf>,
-        /// Only record this process in PresentMon, e.g. game.exe
+        /// The process to focus on, e.g. game.exe (also limits a live PresentMon capture to it)
         #[arg(long)]
         process: Option<String>,
+        /// Record the graphics providers (frames, GPU work) even if the preset does not
+        #[arg(long, conflicts_with = "no_graphics")]
+        graphics: bool,
+        /// Do not record the graphics providers even if the preset does
+        #[arg(long)]
+        no_graphics: bool,
         /// Open the report in the default text editor when done
         #[arg(long)]
         open_report: bool,
@@ -151,6 +157,68 @@ enum TraceCmd {
         #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
     },
+    /// Analyse a trace like WPA: frames and lows, slow frames explained, CPU usage (precise and
+    /// sampled), ready time, waits, hard faults, disk, DPC/ISR (no elevation or toolkit needed)
+    Analyze {
+        etl: PathBuf,
+        /// Process to focus on: name (game.exe) or pid (default: the one presenting most frames)
+        #[arg(long)]
+        process: Option<String>,
+        /// Start of the window to analyse, seconds from the start of the trace
+        #[arg(long, value_name = "SECONDS")]
+        from: Option<f64>,
+        /// End of the window, seconds from the start of the trace
+        #[arg(long, value_name = "SECONDS")]
+        to: Option<f64>,
+        /// Sections to print, comma separated (default: all; see `trace sections`)
+        #[arg(long, short)]
+        section: Option<String>,
+        /// Rows per table
+        #[arg(long, default_value_t = 15)]
+        top: usize,
+        /// How many of the slowest frames to explain
+        #[arg(long, default_value_t = 5)]
+        explain: usize,
+        /// A stutter is a frame longer than this many times the median
+        #[arg(long, default_value_t = 2.0)]
+        stutter: f64,
+        /// Name functions with symbols (downloads PDBs from the symbol server on first use)
+        #[arg(long)]
+        symbols: bool,
+        /// Group the DPC/ISR tables by function instead of by driver
+        #[arg(long)]
+        functions: bool,
+        /// PresentMon.exe to run over the trace for GPU busy, displayed time and latency (default: found on PATH or PRESENTMON)
+        #[arg(long, value_name = "PATH")]
+        presentmon: Option<PathBuf>,
+        /// Do not run PresentMon
+        #[arg(long, conflicts_with = "presentmon")]
+        no_presentmon: bool,
+        /// Write an HTML report with time-line charts
+        #[arg(long, value_name = "FILE")]
+        html: Option<PathBuf>,
+        /// Write everything as JSON
+        #[arg(long, value_name = "FILE")]
+        json: Option<PathBuf>,
+        /// Write collapsed stacks of the samples (focus process) for flame graph tools
+        #[arg(long, value_name = "FILE")]
+        folded: Option<PathBuf>,
+        /// Write the text report to a file instead of the terminal
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
+    /// Write one table of a trace as CSV (processes, threads, cswitch, ready, samples, hard-faults, disk, presents, dpc)
+    Export {
+        etl: PathBuf,
+        /// The table to write (see `trace sections`)
+        #[arg(long)]
+        table: String,
+        /// Output file (default: the terminal)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    /// List the sections of `trace analyze` and the tables of `trace export`
+    Sections,
     /// Summarise a PresentMon CSV
     Frames { csv: PathBuf },
     /// Merge two or more traces into one
@@ -315,6 +383,8 @@ fn run_trace(cmd: TraceCmd) -> Result<ExitCode, String> {
             session,
             presentmon,
             process,
+            graphics,
+            no_graphics,
             open_report,
             open_wpa,
             force,
@@ -332,9 +402,17 @@ fn run_trace(cmd: TraceCmd) -> Result<ExitCode, String> {
                 out_dir,
                 session,
                 presentmon,
-                process,
+                process: process.clone(),
                 force,
                 symbols,
+                graphics: if graphics {
+                    Some(true)
+                } else if no_graphics {
+                    Some(false)
+                } else {
+                    None
+                },
+                focus: process,
                 analysis: AnalysisOptions {
                     by_function: functions,
                     ..AnalysisOptions::default()
@@ -347,6 +425,9 @@ fn run_trace(cmd: TraceCmd) -> Result<ExitCode, String> {
             println!("  trace   {}", r.etl.display());
             if let Some(p) = &r.report {
                 println!("  report  {}", p.display());
+            }
+            if let Some(p) = &r.html {
+                println!("  html    {}", p.display());
             }
             if let Some(p) = &r.presentmon_csv {
                 println!("  frames  {}", p.display());
@@ -401,6 +482,96 @@ fn run_trace(cmd: TraceCmd) -> Result<ExitCode, String> {
                 )
                 .map_err(|e| format!("{}: {e}", p.display()))?;
                 eprintln!("wrote {}", p.display());
+            }
+        }
+        TraceCmd::Analyze {
+            etl,
+            process,
+            from,
+            to,
+            section,
+            top,
+            explain,
+            stutter,
+            symbols,
+            functions,
+            presentmon,
+            no_presentmon,
+            html,
+            json,
+            folded,
+            out,
+        } => {
+            let secs = |v: Option<f64>, d: u64| -> Result<u64, String> {
+                match v {
+                    None => Ok(d),
+                    Some(s) if s.is_finite() && s >= 0.0 => Ok((s * 1e9) as u64),
+                    Some(s) => Err(format!("{s} is not a time in seconds")),
+                }
+            };
+            let (from_ns, to_ns) = (secs(from, 0)?, secs(to, u64::MAX)?);
+            if to_ns <= from_ns {
+                return Err("--to must be after --from".to_string());
+            }
+            let o = trace::full::AnalyzeOptions {
+                analysis: trace::analysis::Options {
+                    from_ns,
+                    to_ns,
+                    focus: process.as_deref().map(trace::analysis::Focus::parse),
+                    top,
+                    stutter_factor: stutter,
+                    explain,
+                },
+                sections: trace::render_sys::parse_sections(section.as_deref())?,
+                symbols,
+                presentmon: match (presentmon, no_presentmon) {
+                    (_, true) => trace::full::PresentMonChoice::Off,
+                    (Some(p), _) => trace::full::PresentMonChoice::Path(p),
+                    (None, _) => trace::full::PresentMonChoice::Auto,
+                },
+                presentmon_csv: None,
+                folded: folded.is_some(),
+                dpc_functions: functions,
+            };
+            let (tr, a) = trace::full::analyze_file(&etl, &o)?;
+            let write = |p: &PathBuf, text: &str| -> Result<(), String> {
+                std::fs::write(p, text).map_err(|e| format!("{}: {e}", p.display()))?;
+                eprintln!("wrote {}", p.display());
+                Ok(())
+            };
+            match &out {
+                Some(p) => write(p, &a.text)?,
+                None => print!("{}", a.text),
+            }
+            if let Some(p) = &json {
+                write(p, &trace::full::to_json(&a))?;
+            }
+            if let Some(p) = &html {
+                write(p, &trace::html::render(&a, &tr, &etl.to_string_lossy()))?;
+            }
+            if let (Some(p), Some(f)) = (&folded, &a.folded) {
+                write(p, f)?;
+            }
+        }
+        TraceCmd::Export { etl, table, out } => {
+            let tr = trace::etl::read(&etl)?;
+            let csv = trace::export::export(&tr, &table)?;
+            match out {
+                Some(p) => {
+                    std::fs::write(&p, csv).map_err(|e| format!("{}: {e}", p.display()))?;
+                    eprintln!("wrote {}", p.display());
+                }
+                None => print!("{csv}"),
+            }
+        }
+        TraceCmd::Sections => {
+            println!("Sections of `trace analyze --section`:");
+            for (n, d) in trace::render_sys::SECTIONS {
+                println!("  {n:<11} {d}");
+            }
+            println!("\nTables of `trace export --table`:");
+            for (n, d) in trace::export::TABLES {
+                println!("  {n:<11} {d}");
             }
         }
         TraceCmd::Frames { csv } => {

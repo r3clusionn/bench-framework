@@ -5,22 +5,22 @@ use super::model::{Analysis, Dist, GroupStats};
 use super::presentmon::Summary;
 
 /// Left- and right-aligned columns.
-struct Table {
+pub(crate) struct Table {
     head: Vec<String>,
     left: usize,
     rows: Vec<Vec<String>>,
 }
 
 impl Table {
-    fn new(head: &[&str], left: usize) -> Table {
+    pub(crate) fn new(head: &[&str], left: usize) -> Table {
         Table { head: head.iter().map(|s| s.to_string()).collect(), left, rows: Vec::new() }
     }
 
-    fn row(&mut self, cells: Vec<String>) {
+    pub(crate) fn row(&mut self, cells: Vec<String>) {
         self.rows.push(cells);
     }
 
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let n = self.head.len();
         let mut w: Vec<usize> = self.head.iter().map(|h| h.chars().count()).collect();
         for r in &self.rows {
@@ -88,7 +88,7 @@ fn kind_label(isr: bool) -> &'static str {
     }
 }
 
-fn section(out: &mut String, title: &str) {
+pub(crate) fn section(out: &mut String, title: &str) {
     out.push('\n');
     out.push_str(title);
     out.push('\n');
